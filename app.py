@@ -12,7 +12,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (accuracy_score, confusion_matrix, f1_score,
                              precision_score, recall_score, silhouette_score,
                              adjusted_rand_score)
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
@@ -61,19 +61,32 @@ def evaluate_models(data: pd.DataFrame):
     ])
     setups = {
         "Logistic Regression": (numeric_scaled, LogisticRegression(
-            class_weight="balanced", max_iter=2000, random_state=42)),
+            class_weight="balanced", max_iter=2000, random_state=42), {
+                "model__C": [0.1, 1.0, 10.0],
+                "model__solver": ["liblinear", "lbfgs"],
+            }),
         "Random Forest": (numeric_plain, RandomForestClassifier(
-            n_estimators=300, class_weight="balanced", random_state=42,
-            min_samples_leaf=2)),
+            random_state=42, n_jobs=1), {
+                "model__n_estimators": [200, 400],
+                "model__max_depth": [None, 8],
+                "model__min_samples_leaf": [1, 2, 4],
+                "model__class_weight": ["balanced", "balanced_subsample"],
+            }),
     }
     rows, matrices = [], {}
-    for name, (numeric_pipe, estimator) in setups.items():
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    for name, (numeric_pipe, estimator, param_grid) in setups.items():
         prep = ColumnTransformer([
             ("numeric", numeric_pipe, numeric),
             ("categorical", categorical_pipe, categorical),
         ])
-        model = Pipeline([("preprocess", prep), ("model", estimator)])
-        model.fit(X_train, y_train)
+        pipeline = Pipeline([("preprocess", prep), ("model", estimator)])
+        search = GridSearchCV(
+            pipeline, param_grid, scoring="f1", cv=cv, n_jobs=-1,
+            refit=True, error_score="raise"
+        )
+        search.fit(X_train, y_train)
+        model = search.best_estimator_
         pred = model.predict(X_test)
         tn, fp, fn, tp = confusion_matrix(y_test, pred, labels=[0, 1]).ravel()
         rows.append({
@@ -82,13 +95,16 @@ def evaluate_models(data: pd.DataFrame):
             "Precision (failure=1)": precision_score(y_test, pred, zero_division=0),
             "Recall (failure=1)": recall_score(y_test, pred, zero_division=0),
             "F1 (failure=1)": f1_score(y_test, pred, zero_division=0),
+            "CV F1 mean": search.best_score_,
+            "CV F1 std": search.cv_results_[search.best_index_]["std_test_score"],
+            "Best parameters": search.best_params_,
             "TN": tn, "FP": fp, "FN": fn, "TP": tp,
         })
         matrices[name] = pd.DataFrame(
             [[tn, fp], [fn, tp]], index=["จริง: ปกติ", "จริง: ขัดข้อง"],
             columns=["ทำนาย: ปกติ", "ทำนาย: ขัดข้อง"])
     return pd.DataFrame(rows).set_index("Model").sort_values(
-        "F1 (failure=1)", ascending=False), matrices
+        "CV F1 mean", ascending=False), matrices
 
 
 st.set_page_config(page_title="Machine Failure Prediction", page_icon="⚙️", layout="wide")
@@ -175,16 +191,19 @@ with tabs[1]:
 
 with tabs[2]:
     st.subheader("เปรียบเทียบ Logistic Regression และ Random Forest")
-    st.caption("แบ่งข้อมูล 80/20 แบบ stratified และประเมินด้วยชุดทดสอบเดียวกับใน notebook")
+    st.caption("จูนพารามิเตอร์ด้วย 5-fold Stratified CV บน train 80%; ชุด test 20% ใช้ประเมินครั้งสุดท้าย")
     metrics, matrices = evaluate_models(data)
     display_metrics = metrics[["Accuracy", "Precision (failure=1)",
-                               "Recall (failure=1)", "F1 (failure=1)"]]
+                               "Recall (failure=1)", "F1 (failure=1)",
+                               "CV F1 mean", "CV F1 std"]]
     st.dataframe(display_metrics.style.format("{:.3f}"), use_container_width=True)
     best_name = metrics.index[0]
     best = metrics.iloc[0]
-    st.info(f"F1 สูงสุด: {best_name} — Accuracy {best['Accuracy']:.3f}, "
+    st.info(f"CV F1 สูงสุด: {best_name} — Test F1 {best['F1 (failure=1)']:.3f}, "
             f"Precision {best['Precision (failure=1)']:.3f}, "
             f"Recall {best['Recall (failure=1)']:.3f}, F1 {best['F1 (failure=1)']:.3f}")
+    with st.expander("พารามิเตอร์ที่เลือกจาก Cross-validation"):
+        st.json(metrics["Best parameters"].to_dict())
     for name, matrix in matrices.items():
         st.markdown(f"**Confusion Matrix: {name}** (แถว=ค่าจริง, คอลัมน์=ค่าทำนาย)")
         st.dataframe(matrix, use_container_width=True)
